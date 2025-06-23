@@ -1,0 +1,175 @@
+---
+title: "Access to Itaú Bikes in Recife"
+author: "Vinicius Hiago e Silva Gerônimo"
+date: "today"
+format:
+  html:
+    mainfont: Playfair Display
+    sansfont: Playfair Display
+    highlight: tango
+    toc: true               
+    toc-location: left      
+    toc-float: true         
+    code-fold: true         
+    code-summary: "Show Code"
+---
+
+#### The following map identifies all areas in Recife that are within a 30-minute walk of an Itaú bike station, highlighting the system's effective service area versus the regions left unserved.
+
+```{r setup}
+#| echo: false
+#| warning: false
+#| include: false
+#| message: false
+
+setwd('C:\\Users\\vinih\\OneDrive\\Documentos\\VINICIUS\\PROJETOS R\\acesso_bikes')
+
+packages = c("dplyr", "ggplot2", "readr", "sf", "h3jsr", 
+              "knitr", 'showtext', "osrm", "geobr")
+
+for (pck in packages) {
+  if (!requireNamespace(pck, quietly = TRUE)) {
+    install.packages(pck)
+  }
+}
+lapply(packages, library, character.only = TRUE)
+
+# Load font for plotting
+font_add_google(name = 'Playfair Display', family = 'pf')
+showtext_auto()
+```
+
+## Itaú bike stations
+
+To identify the station locations, I used a file available at **dados.recife.gov.br**, which shows the location of all stations that existed as of January 2024.
+
+```{r}
+#| echo: true
+#| message: false
+#| warning: false
+#| code-fold: show
+
+# Read file
+estacoes = read_delim("estacoes.csv", 
+    delim = ";", escape_double = FALSE, trim_ws = TRUE)
+
+# Geocoding stations
+estacoes = st_as_sf(
+  estacoes,
+  coords = c("longitude", "latitude"),
+  crs = 4326
+  )
+```
+
+## Grids
+
+The hexagonal grid was created using the `h3jsr` package in R, which provides access to **Uber's H3** geospatial indexing system. H3 is a hierarchical grid system composed of hexagons at multiple resolution levels. For this analysis, **resolution 9** was chosen, which corresponds to hexagons with an average area of approximately 0.11 square kilometers.
+
+```{r}
+#| echo: true
+#| message: false
+#| warning: false
+#| code-fold: show
+
+# Get municipality border
+recife_sf = read_municipality(code_muni = 2611606)
+recife_sf = st_transform(recife_sf, crs = 4326)
+
+# Filter only the stations in Recife
+stations_em_recife_sf = st_filter(estacoes, recife_sf)
+
+
+# Create the grids
+grid_recife = polygon_to_cells(recife_sf, 
+                                res = 9, 
+                                simple = FALSE)
+
+
+grid_recife = cell_to_polygon(grid_recife$h3_addresses,
+                               simple = FALSE)
+```
+
+## Isochrones
+
+This analysis uses isochrones—polygons that show the reachable area from a location within a specific timeframe. Using the `osrm` package, which interfaces with **OpenStreetMap**'s routing engine, I generated a **30-minute walking** isochrone for each bike station to map the system's overall service area.
+
+```{r}
+#| echo: true
+#| message: false
+#| warning: false
+#| code-fold: show
+
+# Create a function to get the isochrone.
+get_isochrone = function(df) {
+  iso = osrmIsochrone(
+    loc = df[1, ], 
+    breaks = c(0, 30),
+    osrm.profile = "foot"
+  )
+  return(iso)
+}
+
+
+# Create a list where each item corresponds to a station.
+lista_de_estacoes = split(stations_em_recife_sf, f = stations_em_recife_sf$codigo)
+
+
+# Apply the function to each station
+lista_de_isocronas = lapply(lista_de_estacoes, get_isochrone)
+
+sf_use_s2(FALSE)
+
+lista_de_isocronas_limpas = lapply(lista_de_isocronas, function(iso_individual) {
+  st_buffer(iso_individual, dist = 0)
+})
+
+
+# Group the results
+mapa_isocronas_final = bind_rows(lista_de_isocronas_limpas) %>% st_union()
+```
+
+To determine which parts of the city have access, all individual station service areas (isochrones) were first merged into a single comprehensive coverage area. Then, each hexagonal cell of the city grid was spatially checked against this coverage area, and categorized as either having access ('Yes') or not ('No').
+
+```{r}
+#| echo: true
+#| message: false
+#| warning: false
+
+# Checks whether a geometry is valid
+mapa_isocronas_final = st_union(mapa_isocronas_final) %>% st_make_valid()
+
+# Intersection of the grid and the isochrones
+intersecao = st_intersects(grid_recife, mapa_isocronas_final, sparse = FALSE)
+
+# Labelled each grid
+grid_recife$tem_acesso = ifelse(intersecao[, 1], "Sim", "Não")
+```
+
+## Map
+
+```{r plotar-mapa-final}
+#| echo: true
+#| message: false
+#| warning: false
+#| fig.width: 16
+#| fig.height: 14
+
+ggplot() +
+  geom_sf(data = grid_recife, aes(fill = tem_acesso), color = "white", linewidth = 0.01) +
+    scale_fill_manual(values = c("Sim" = "#D75C20", "Não" = "#AFB3B3")) +
+  labs(
+    title = "Accessibility to Itaú Bike Stations in Recife",
+    subtitle = "Areas that are within a 30-minute walk of a station (in orange)",
+    caption = "Fonte: Prefeitura de Recife; Open Street Map."
+  ) +
+  theme_void() +
+  theme(
+    plot.title = element_text(family = "pf", size = 100, face = "bold", color = "#222222", hjust = 0.5),
+    plot.subtitle = element_text(family = "pf", size = 50, color = "#555555", hjust = 0.5),
+    legend.text = element_text(family = "pf", size = 45),
+    plot.caption = element_text(family = "pf", size = 40, hjust = 0.5),
+    legend.position = 'none',
+    legend.key.width = unit(1.8, "cm"),
+    legend.key.size= unit(0.7, "cm")
+  )
+```
